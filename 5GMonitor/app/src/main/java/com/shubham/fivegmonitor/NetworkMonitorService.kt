@@ -110,7 +110,7 @@ class NetworkMonitorService : Service() {
 
     private fun networkLabel(type: Int): String = when (type) {
         TelephonyManager.NETWORK_TYPE_LTE -> "4G / LTE"
-        TelephonyManager.NETWORK_TYPE_3G, TelephonyManager.NETWORK_TYPE_HSPA, TelephonyManager.NETWORK_TYPE_HSPAP -> "3G"
+        TelephonyManager.NETWORK_TYPE_UMTS, TelephonyManager.NETWORK_TYPE_HSPA, TelephonyManager.NETWORK_TYPE_HSPAP -> "3G"
         TelephonyManager.NETWORK_TYPE_GPRS, TelephonyManager.NETWORK_TYPE_EDGE -> "2G"
         TelephonyManager.NETWORK_TYPE_NR -> "5G"
         else -> "Mobile network changed"
