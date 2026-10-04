@@ -5,125 +5,27 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.media.AudioAttributes
-import android.media.AudioManager
-import android.media.MediaPlayer
-import android.media.RingtoneManager
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.PowerManager
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
+import android.telephony.ServiceState
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyDisplayInfo
 import android.telephony.TelephonyManager
 import android.widget.Toast
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
-
-/** Plays the alarm. Shared by the service and the "Test alarm" button. */
-object Alarm {
-    private var player: MediaPlayer? = null
-    private var vib: Vibrator? = null
-    private var savedVol = -1
-    val playing: Boolean get() = player != null
-
-    fun start(ctx: Context) {
-        stop(ctx)
-        val c = ctx.applicationContext
-        val p = c.getSharedPreferences("monitor", Context.MODE_PRIVATE)
-        val am = c.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        savedVol = am.getStreamVolume(AudioManager.STREAM_ALARM)
-        val max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-        try {
-            am.setStreamVolume(AudioManager.STREAM_ALARM, maxOf(1, max * p.getInt("s_volume", 100) / 100), 0)
-        } catch (_: Exception) { }
-        val custom = p.getString("s_sound", "") ?: ""
-        val candidates = listOfNotNull(
-            if (custom.isNotEmpty()) Uri.parse(custom) else null,
-            RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
-            RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
-            RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-        )
-        for (u in candidates) { if (play(c, u)) break }
-        if (p.getBoolean("s_vibrate", true)) vibrate(c)
-    }
-
-    private fun play(c: Context, uri: Uri): Boolean {
-        val mp = MediaPlayer()
-        return try {
-            mp.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ALARM)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-            )
-            mp.setWakeMode(c, PowerManager.PARTIAL_WAKE_LOCK)
-            mp.setDataSource(c, uri)
-            mp.isLooping = true
-            mp.prepare()
-            mp.start()
-            player = mp
-            true
-        } catch (e: Exception) {
-            try { mp.release() } catch (_: Exception) { }
-            false
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun vibrate(c: Context) {
-        try {
-            val v: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-                (c.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-            else c.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-            vib = v
-            v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 700, 500), 0))
-        } catch (_: Exception) { }
-    }
-
-    fun stop(ctx: Context) {
-        try { player?.stop() } catch (_: Exception) { }
-        try { player?.release() } catch (_: Exception) { }
-        player = null
-        try { vib?.cancel() } catch (_: Exception) { }
-        vib = null
-        if (savedVol >= 0) {
-            try {
-                (ctx.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager)
-                    .setStreamVolume(AudioManager.STREAM_ALARM, savedVol, 0)
-            } catch (_: Exception) { }
-            savedVol = -1
-        }
-    }
-}
-
-class BootReceiver : BroadcastReceiver() {
-    override fun onReceive(c: Context, i: Intent) {
-        val p = c.getSharedPreferences("monitor", Context.MODE_PRIVATE)
-        if (i.action == Intent.ACTION_BOOT_COMPLETED && p.getBoolean("s_boot", false)) {
-            try {
-                c.startForegroundService(
-                    Intent(c, NetworkMonitorService::class.java).setAction(NetworkMonitorService.ACTION_START)
-                )
-            } catch (_: Exception) { }
-        }
-    }
-}
 
 class NetworkMonitorService : Service() {
     companion object {
         const val ACTION_START = "com.shubham.fivegmonitor.START"
         const val ACTION_STOP = "com.shubham.fivegmonitor.STOP"
         const val ACTION_DISMISS = "com.shubham.fivegmonitor.DISMISS"
+        const val ACTION_SNOOZE = "com.shubham.fivegmonitor.SNOOZE"
         private const val CH_STATUS = "network_monitor"
         private const val CH_ALERT = "network_alert"
         private const val ID_STATUS = 5105
@@ -140,11 +42,21 @@ class NetworkMonitorService : Service() {
     private var dismissed = false
     private var alarmOn = false
     private var label = "Checking…"
+    private var snoozeUntil = 0L
+    private var noSvc = false
+    private var lastG = false
+    private var lastLabel = "Checking…"
 
     override fun onCreate() {
         super.onCreate()
         tm = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
         createChannels()
+        Alarm.onFinished = {
+            alarmOn = false; dismissed = true
+            nm.cancel(ID_ALERT)
+            addLog("Alarm finished")
+            refresh()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -153,8 +65,16 @@ class NetworkMonitorService : Service() {
             ACTION_DISMISS -> {
                 dismissed = true
                 handler.removeCallbacksAndMessages(null)
+                stopAlarm(); refresh()
+                return START_STICKY
+            }
+            ACTION_SNOOZE -> {
+                val min = p.getInt("s_snooze", 10)
+                snoozeUntil = System.currentTimeMillis() + min * 60000L
+                dismissed = false
                 stopAlarm()
-                refresh()
+                addLog("Snoozed for $min min")
+                maybeAlert(); refresh()
                 return START_STICKY
             }
             else -> {
@@ -173,13 +93,22 @@ class NetworkMonitorService : Service() {
             stopMonitoring(); return
         }
         p.edit().putBoolean("enabled", true).putBoolean("is5g", false).putString("network", "Checking…").apply()
-        current = null; seen5g = false; dismissed = false
-        val cb = object : TelephonyCallback(), TelephonyCallback.DisplayInfoListener {
+        current = null; seen5g = false; dismissed = false; noSvc = false; snoozeUntil = 0L
+        val cb = object : TelephonyCallback(), TelephonyCallback.DisplayInfoListener, TelephonyCallback.ServiceStateListener {
             override fun onDisplayInfoChanged(info: TelephonyDisplayInfo) {
-                val g = info.networkType == TelephonyManager.NETWORK_TYPE_NR ||
+                lastG = info.networkType == TelephonyManager.NETWORK_TYPE_NR ||
                     info.overrideNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA ||
                     info.overrideNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_ADVANCED
-                onState(g, if (g) "5G" else typeLabel(info.networkType))
+                lastLabel = if (lastG) "5G" else typeLabel(info.networkType)
+                if (!noSvc) onState(lastG, lastLabel)
+            }
+
+            override fun onServiceStateChanged(serviceState: ServiceState) {
+                val out = serviceState.state != ServiceState.STATE_IN_SERVICE
+                if (out != noSvc) {
+                    noSvc = out
+                    if (out) onState(false, "No service") else onState(lastG, lastLabel)
+                }
             }
         }
         callback = cb
@@ -191,24 +120,36 @@ class NetworkMonitorService : Service() {
         current = is5g
         label = newLabel
         p.edit().putString("network", newLabel).putBoolean("is5g", is5g).apply()
-        handler.removeCallbacksAndMessages(null)
         if (prev != is5g) {
             addLog(if (is5g) "5G connected" else if (prev == null) "Started on $newLabel" else "5G lost → $newLabel")
         }
         if (is5g) {
-            seen5g = true
-            dismissed = false
+            seen5g = true; dismissed = false; snoozeUntil = 0L
             if (alarmOn && p.getBoolean("s_autostop", true)) stopAlarm()
-        } else if (!alarmOn && !dismissed && (p.getInt("s_mode", 1) == 1 || seen5g)) {
-            val delayMs = p.getInt("s_delay", 0) * 1000L
-            handler.postDelayed({ if (current == false) raiseAlarm() }, delayMs)
         }
+        maybeAlert()
         refresh()
+    }
+
+    private fun inQuietHours(): Boolean {
+        if (!p.getBoolean("s_quiet", false)) return false
+        val hr = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        val s = p.getInt("s_qs", 23)
+        val e = p.getInt("s_qe", 7)
+        return if (s == e) false else if (s < e) hr in s until e else (hr >= s || hr < e)
+    }
+
+    private fun maybeAlert() {
+        handler.removeCallbacksAndMessages(null)
+        if (current != false || alarmOn || dismissed || inQuietHours()) return
+        if (!(p.getInt("s_mode", 1) == 1 || seen5g)) return
+        val d = maxOf(p.getInt("s_delay", 0) * 1000L, snoozeUntil - System.currentTimeMillis())
+        handler.postDelayed({ if (current == false && !alarmOn) raiseAlarm() }, d)
     }
 
     private fun raiseAlarm() {
         alarmOn = true
-        Alarm.start(this)
+        Alarm.start(this, true)
         addLog("Alarm started")
         nm.notify(ID_ALERT, notif(CH_ALERT, "Not on 5G — now on $label", true))
         refresh()
@@ -223,7 +164,7 @@ class NetworkMonitorService : Service() {
     private fun addLog(msg: String) {
         val t = SimpleDateFormat("dd MMM HH:mm:ss", Locale.getDefault()).format(Date())
         val old = (p.getString("log", "") ?: "").split("\n").filter { it.isNotBlank() }
-        p.edit().putString("log", (listOf("$t  $msg") + old).take(15).joinToString("\n")).apply()
+        p.edit().putString("log", (listOf("$t  $msg") + old).take(20).joinToString("\n")).apply()
     }
 
     private fun typeLabel(type: Int): String = when (type) {
@@ -254,7 +195,11 @@ class NetworkMonitorService : Service() {
             val dismiss = PendingIntent.getService(
                 this, 2, Intent(this, NetworkMonitorService::class.java).setAction(ACTION_DISMISS), flags
             )
-            b.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Dismiss alarm", dismiss)
+            val snooze = PendingIntent.getService(
+                this, 3, Intent(this, NetworkMonitorService::class.java).setAction(ACTION_SNOOZE), flags
+            )
+            b.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Dismiss", dismiss)
+            b.addAction(android.R.drawable.ic_menu_recent_history, "Snooze", snooze)
         }
         return b.build()
     }
@@ -284,6 +229,11 @@ class NetworkMonitorService : Service() {
         stopSelf()
     }
 
-    override fun onDestroy() { stopAlarm(); super.onDestroy() }
+    override fun onDestroy() {
+        Alarm.onFinished = null
+        stopAlarm()
+        super.onDestroy()
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 }
