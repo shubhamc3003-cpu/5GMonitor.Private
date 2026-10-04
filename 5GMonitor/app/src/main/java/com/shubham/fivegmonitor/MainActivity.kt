@@ -15,9 +15,12 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
@@ -109,6 +112,21 @@ class MainActivity : Activity() {
         })
     }
 
+    /** Adds a labelled slider to a card. valueText turns the raw progress into the label. */
+    private fun LinearLayout.addSlider(key: String, def: Int, max: Int, offset: Int, step: Int, valueText: (Int) -> String) {
+        val l = label("", 14f, INK)
+        val start = (prefs.getInt(key, def) - offset) / step
+        l.text = valueText(start * step + offset)
+        addView(l, lp(14))
+        addView(slider(max, start) { v ->
+            val real = v * step + offset
+            l.text = valueText(real)
+            prefs.edit().putInt(key, real).apply()
+        })
+    }
+
+    private fun hourName(h: Int) = String.format("%02d:00", h)
+
     // ---------- UI ----------
     private fun buildUi() {
         val root = LinearLayout(this).apply {
@@ -136,38 +154,60 @@ class MainActivity : Activity() {
         testBtn = button("Test alarm", DARK) { toggleTest() }
         root.addView(testBtn, lp(8))
 
-        // ----- alert settings -----
-        root.addView(label("Alert settings", 17f, INK, true), lp(26))
-        val s = card()
+        // ----- when to alert -----
+        root.addView(label("When to alert", 17f, INK, true), lp(26))
+        val a = card()
         val rg = RadioGroup(this)
-        rg.addView(RadioButton(this).apply { text = "Alert whenever I'm not on 5G"; id = 1 })
-        rg.addView(RadioButton(this).apply { text = "Alert only after 5G was connected, then lost"; id = 2 })
+        rg.addView(RadioButton(this).apply { text = "Whenever I'm not on 5G"; id = 1 })
+        rg.addView(RadioButton(this).apply { text = "Only after 5G was connected, then lost"; id = 2 })
         rg.check(if (prefs.getInt("s_mode", 1) == 1) 1 else 2)
         rg.setOnCheckedChangeListener { _, id -> prefs.edit().putInt("s_mode", if (id == 1) 1 else 0).apply() }
-        s.addView(rg)
+        a.addView(rg)
+        a.addSlider("s_delay", 0, 12, 0, 5) { if (it == 0) "Delay before alarm: none" else "Delay before alarm: $it s" }
+        a.addSlider("s_snooze", 10, 29, 1, 1) { "Snooze length: $it min" }
+        a.addView(sw("Stop alarm when 5G returns", "s_autostop", true), lp(14))
+        a.addView(sw("Quiet hours (no alarm)", "s_quiet", false), lp(8))
+        a.addSlider("s_qs", 23, 23, 0, 1) { "Quiet from ${hourName(it)}" }
+        a.addSlider("s_qe", 7, 23, 0, 1) { "Quiet until ${hourName(it)}" }
+        root.addView(a, lp(8))
 
-        val dLabel = label("", 14f, INK)
-        fun dText(v: Int) { dLabel.text = if (v == 0) "Delay before alarm: none" else "Delay before alarm: ${v * 5} s" }
-        val d0 = prefs.getInt("s_delay", 0) / 5
-        dText(d0)
-        s.addView(dLabel, lp(14))
-        s.addView(slider(12, d0) { dText(it); prefs.edit().putInt("s_delay", it * 5).apply() })
-
-        val vLabel = label("", 14f, INK)
-        fun vText(v: Int) { vLabel.text = "Alarm volume: ${v + 10}%" }
-        val v0 = prefs.getInt("s_volume", 100) - 10
-        vText(v0)
-        s.addView(vLabel, lp(14))
-        s.addView(slider(90, v0) { vText(it); prefs.edit().putInt("s_volume", it + 10).apply() })
-
-        s.addView(sw("Vibrate with alarm", "s_vibrate", true), lp(14))
-        s.addView(sw("Stop alarm when 5G returns", "s_autostop", true), lp(8))
-        s.addView(sw("Start monitoring after phone restarts", "s_boot", false), lp(8))
+        // ----- how it sounds -----
+        root.addView(label("How it sounds", 17f, INK, true), lp(26))
+        val s = card()
+        val tg = RadioGroup(this)
+        tg.addView(RadioButton(this).apply { text = "Voice (speaks a phrase)"; id = 1 })
+        tg.addView(RadioButton(this).apply { text = "Music / alarm sound"; id = 2 })
+        tg.check(if (prefs.getInt("s_type", 0) == 0) 1 else 2)
+        tg.setOnCheckedChangeListener { _, id -> prefs.edit().putInt("s_type", if (id == 1) 0 else 1).apply() }
+        s.addView(tg)
+        s.addView(label("Voice phrase", 13f, MUTED), lp(10))
+        val phrase = EditText(this).apply {
+            setText(prefs.getString("s_phrase", "5G signal lost"))
+            setSingleLine(true)
+            addTextChangedListener(object : TextWatcher {
+                override fun afterTextChanged(e: Editable?) {
+                    val t = e?.toString()?.trim().orEmpty()
+                    prefs.edit().putString("s_phrase", if (t.isEmpty()) "5G signal lost" else t).apply()
+                }
+                override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+                override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            })
+        }
+        s.addView(phrase)
+        s.addSlider("s_times", 3, 10, 0, 1) { if (it == 0) "Rings: until dismissed" else "Rings: $it time" + (if (it > 1) "s" else "") }
+        s.addSlider("s_volume", 100, 90, 10, 1) { "Alarm volume: $it%" }
+        s.addView(sw("Get louder with each ring", "s_escalate", false), lp(12))
+        s.addView(sw("Vibrate with alarm", "s_vibrate", true), lp(8))
         root.addView(s, lp(8))
 
-        // ----- sound & battery -----
         soundBtn = button("", DARK) { pickSound() }
         root.addView(soundBtn, lp(12))
+
+        // ----- system -----
+        root.addView(label("System", 17f, INK, true), lp(26))
+        val y = card()
+        y.addView(sw("Start monitoring after phone restarts", "s_boot", false))
+        root.addView(y, lp(8))
         root.addView(button("Battery settings (recommended)", DARK) {
             try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
             catch (e: Exception) { Toast.makeText(this, "Open Settings > Apps > 5G Monitor > Battery", Toast.LENGTH_LONG).show() }
@@ -225,7 +265,7 @@ class MainActivity : Activity() {
         testing = true
         Alarm.start(this)
         testBtn.text = "Stop test"
-        handler.postDelayed({ stopTest() }, 8000)
+        handler.postDelayed({ stopTest() }, 12000)
     }
 
     private fun stopTest() {
@@ -260,6 +300,6 @@ class MainActivity : Activity() {
         val s = prefs.getString("s_sound", "") ?: ""
         val name = if (s.isEmpty()) "Default alarm"
         else (try { RingtoneManager.getRingtone(this, Uri.parse(s))?.getTitle(this) } catch (e: Exception) { null } ?: "Custom")
-        soundBtn.text = "Alarm sound: $name"
+        soundBtn.text = "Music for 'Music' mode: $name"
     }
 }
