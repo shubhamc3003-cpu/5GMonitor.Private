@@ -1,0 +1,16 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.shubham.fivegmonitor'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.shubham.fivegmonitor'
+        minSdk 26
+        targetSdk 33
+        versionCode 1
+        versionName '1.0'
+    }
+}
